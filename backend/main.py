@@ -1,69 +1,75 @@
-from fastapi import FastAPI, WebSocket, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from models import JobRequest, JobResponse
 import asyncio
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-from agents import run_litmus_agent
+from agents import DEMO, check_linkedin, check_mca, check_reddit, resolve_job
+from scoring import build_report
 
-app = FastAPI(title="Litmus Backend Engine")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Litmus")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-cache_db = {}
-history_db = []
 
-@app.get("/")
-def read_root():
-    return {"message": "Backend server is running"}
+class Req(BaseModel):
+    query: str  # company name OR job posting link
 
-@app.websocket("/ws/status")
-async def websocket_status(websocket: WebSocket):
-    await websocket.accept()
-    steps = [
-        "Initializing TinyFish headless browsers in parallel...",
-        "Navigating to Public Search & MCA Portal...",
-        "MCA Registry Check in progress...",
-        "Scraping public headcount & velocity metrics...",
-        "Running sentiment analysis on community/review threads...",
-        "Compiling final 100-Point Reality Score..."
-    ]
+
+async def analyze(query: str, emit=None) -> dict:
+    async def send(msg):
+        if emit: await emit(msg)
+
+    company = query.strip()
+    if company.lower().startswith(("http://", "https://")):  # step 1: "Submit Job Link"
+        await send({"type": "status", "step": "resolve", "state": "running"})
+        try:
+            job = await resolve_job(company, lambda m: send({"type": "progress", "step": "resolve", "message": m}))
+            company = job.get("company") or company
+            await send({"type": "status", "step": "resolve", "state": "done"})
+        except Exception as e:
+            await send({"type": "status", "step": "resolve", "state": "error"})
+            raise RuntimeError(f"Could not read the job link: {e}")
+    await send({"type": "company", "company": company})
+
+    async def step(name, fn):
+        await send({"type": "status", "step": name, "state": "running"})
+        try:
+            res = await fn(company, lambda m: send({"type": "progress", "step": name, "message": m}))
+            state = "done"
+        except Exception as e:  # one failing agent must not kill the whole report
+            res, state = {"error": str(e)}, "error"
+            await send({"type": "progress", "step": name, "message": str(e)[:200]})
+        await send({"type": "status", "step": name, "state": state})
+        return name, res
+
+    # step 3: trigger the three async TinyFish agents in parallel
+    raw = dict(await asyncio.gather(step("legal", check_mca), step("velocity", check_linkedin),
+                                    step("sentiment", check_reddit)))
+    return build_report(company, raw)
+
+
+@app.get("/api/health")
+def health():
+    return {"ok": True, "demo_mode": DEMO}
+
+
+@app.post("/api/analyze")
+async def analyze_rest(req: Req):
+    return await analyze(req.query)
+
+
+@app.websocket("/ws/analyze")
+async def analyze_ws(ws: WebSocket):
+    await ws.accept()
     try:
-        for step in steps:
-            await websocket.send_json({"message": step})
-            await asyncio.sleep(1.2)
-    except Exception as e:
-        print(f"WS Closed: {e}")
-
-@app.post("/api/submit-job", response_model=JobResponse)
-async def submit_job(request: JobRequest):
-    if request.job_url in cache_db:
-        return cache_db[request.job_url]
-    
-    try:
-        agent_data = await run_litmus_agent(request.company_name, request.job_url)
-        
-        result = JobResponse(
-            company_name=request.company_name if request.company_name and request.company_name != "Auto-detected" else "Target Startup", 
-            job_url=request.job_url,
-            status="completed",
-            raw_extraction=agent_data["raw_extraction"],
-            reality_score=agent_data["reality_score"]
-        )
-        
-        cache_db[request.job_url] = result
-        history_db.insert(0, result)
-        
-        return result
-
-    except Exception as e:
-        print(f"Agent Execution Failed: {e}")
-        raise HTTPException(status_code=500, detail="Litmus analysis failed.")
-
-@app.get("/api/history", response_model=list[JobResponse])
-async def get_history():
-    return history_db[:10]
+        while True:
+            msg = await ws.receive_json()
+            q = (msg.get("query") or "").strip()
+            if not q:
+                await ws.send_json({"type": "error", "message": "company name or job link required"}); continue
+            try:
+                report = await analyze(q, ws.send_json)
+                await ws.send_json({"type": "result", "report": report})
+            except Exception as e:
+                await ws.send_json({"type": "error", "message": str(e)})
+    except WebSocketDisconnect:
+        pass
