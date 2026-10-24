@@ -1,184 +1,181 @@
-import { useState, useEffect } from 'react';
+import { useState, useRef } from 'react';
 
 export default function App() {
-  const [jobUrl, setJobUrl] = useState('');
-  const [companyName, setCompanyName] = useState('');
+  const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<any>(null);
-  const [liveStatus, setLiveStatus] = useState<string[]>([]);
-  const [history, setHistory] = useState<any[]>([]);
+  const [report, setReport] = useState<any>(null);
+  const [liveStatus, setLiveStatus] = useState<{ step: string; message: string; state: string }[]>([]);
+  const wsRef = useRef<WebSocket | null>(null);
 
-  useEffect(() => {
-    fetchHistory();
-  }, []);
+  const startAnalysis = () => {
+    if (!query.trim()) return;
 
-  const fetchHistory = async () => {
-    try {
-      const res = await fetch('http://127.0.0.1:8000/api/history');
-      const data = await res.json();
-      setHistory(data);
-    } catch (e) {
-      console.error("Failed to fetch history");
-    }
-  };
-
-  const analyzeJob = async () => {
-    if (!jobUrl && !companyName) return;
-    
     setLoading(true);
-    setResult(null);
-    setLiveStatus([]); 
+    setReport(null);
+    setLiveStatus([]);
 
-    const ws = new WebSocket('ws://127.0.0.1:8000/ws/status');
+    const ws = new WebSocket('ws://127.0.0.1:8000/ws/analyze');
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ query }));
+    };
+
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        setLiveStatus(prev => [...prev, data.message]);
+        
+        if (data.type === 'status') {
+          setLiveStatus(prev => {
+            const index = prev.findIndex(item => item.step === data.step);
+            if (index !== -1) {
+              const updated = [...prev];
+              updated[index] = { ...updated[index], state: data.state };
+              return updated;
+            } else {
+              return [...prev, { step: data.step, message: `Running ${data.step}...`, state: data.state }];
+            }
+          });
+        } else if (data.type === 'progress') {
+          setLiveStatus(prev => {
+            const index = prev.findIndex(item => item.step === data.step);
+            if (index !== -1) {
+              const updated = [...prev];
+              updated[index] = { ...updated[index], message: data.message };
+              return updated;
+            } else {
+              return [...prev, { step: data.step, message: data.message, state: 'running' }];
+            }
+          });
+        } else if (data.type === 'result') {
+          setReport(data.report);
+          setLoading(false);
+          ws.close();
+        } else if (data.type === 'error') {
+          setLiveStatus(prev => [...prev, { step: 'error', message: data.message, state: 'error' }]);
+          setLoading(false);
+          ws.close();
+        }
       } catch (e) {
-        setLiveStatus(prev => [...prev, event.data]);
+        console.error("Failed to parse WS message", e);
       }
     };
 
-    try {
-      const response = await fetch('http://127.0.0.1:8000/api/submit-job', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          job_url: jobUrl || "https://example.com", 
-          company_name: companyName || "Auto-detected" 
-        })
-      });
-      
-      const data = await response.json();
-      setResult(data);
-      fetchHistory();
-    } catch (error) {
-      setLiveStatus(prev => [...prev, "Error: Failed to connect to backend engine."]);
-    }
-    
-    ws.close();
-    setLoading(false);
+    ws.onerror = () => {
+      setLiveStatus(prev => [...prev, { step: 'connection', message: 'Backend connection failed.', state: 'error' }]);
+      setLoading(false);
+    };
   };
 
   return (
-    <div className="min-h-screen bg-white flex font-sans text-gray-900">
-      
-      {/* Main Content Area */}
-      <div className="flex-1 p-10 overflow-y-auto">
-        <div className="max-w-3xl mx-auto">
-          
-          <div className="mb-8">
-            <h1 className="text-2xl font-semibold tracking-tight text-black mb-1">Litmus</h1>
-            <p className="text-sm text-gray-500 mb-6">Autonomous verification engine for companies and job listings.</p>
-            
-            <div className="flex flex-col gap-3">
-              <div className="flex gap-2">
-                <input 
-                  type="text" 
-                  className="flex-1 px-4 py-2.5 rounded-md border border-gray-300 text-sm focus:outline-none focus:border-black"
-                  placeholder="Company Name (e.g. Zomato)" 
-                  value={companyName}
-                  onChange={(e) => setCompanyName(e.target.value)}
-                />
-                <input 
-                  type="text" 
-                  className="flex-1 px-4 py-2.5 rounded-md border border-gray-300 text-sm focus:outline-none focus:border-black"
-                  placeholder="Job URL (Optional)" 
-                  value={jobUrl}
-                  onChange={(e) => setJobUrl(e.target.value)}
-                />
-              </div>
-              <button 
-                onClick={analyzeJob} 
-                className="bg-black text-white px-4 py-2.5 rounded-md text-sm font-medium hover:bg-gray-800 transition-colors disabled:opacity-50"
-                disabled={loading}
-              >
-                {loading ? 'Analyzing Records...' : 'Run Verification'}
-              </button>
-            </div>
-          </div>
-
-          {/* Live Terminal */}
-          {loading && (
-            <div className="bg-gray-50 border border-gray-200 text-gray-700 p-4 rounded-md font-mono text-xs max-w-none shadow-sm mb-6">
-              <div className="text-gray-400 mb-2 pb-1 border-b border-gray-200">System Execution Logs</div>
-              {liveStatus.map((msg, idx) => (
-                <div key={idx} className="py-0.5">&gt; {msg}</div>
-              ))}
-              <div className="animate-pulse mt-1 text-gray-500">&gt; processing...</div>
-            </div>
-          )}
-
-          {/* Result Dashboard */}
-          {result && !loading && (
-            <div className="space-y-6 mt-6">
-              <div className="bg-gray-50 p-6 rounded-md border border-gray-200 flex justify-between items-center">
-                <div>
-                  <div className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Verified Entity</div>
-                  <div className="text-xl font-semibold text-black">{result.company_name}</div>
-                </div>
-                <div className="text-right">
-                  <div className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Reality Score</div>
-                  <div className="text-3xl font-semibold text-black">
-                    {result.reality_score.total_score} <span className="text-sm font-normal text-gray-400">/ 100</span>
-                  </div>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div className="bg-white p-4 rounded-md border border-gray-200">
-                  <div className="text-xs font-medium text-gray-500 mb-1">Legal Status</div>
-                  <div className="text-2xl font-semibold text-black mb-2">{result.reality_score.s_legal}</div>
-                  <div className="text-xs text-gray-600">
-                    {result.raw_extraction.mca_verified ? 'Registered Entity (MCA)' : 'Unregistered'}
-                  </div>
-                </div>
-                
-                <div className="bg-white p-4 rounded-md border border-gray-200">
-                  <div className="text-xs font-medium text-gray-500 mb-1">Velocity Metrics</div>
-                  <div className="text-2xl font-semibold text-black mb-2">{result.reality_score.s_velocity}</div>
-                  <div className="text-xs text-gray-600">
-                    Hires: {result.raw_extraction.linkedin_hires} | Openings: {result.raw_extraction.linkedin_openings}
-                  </div>
-                </div>
-
-                <div className="bg-white p-4 rounded-md border border-gray-200">
-                  <div className="text-xs font-medium text-gray-500 mb-1">Sentiment & Flags</div>
-                  <div className="text-2xl font-semibold text-black mb-2">{result.reality_score.s_sentiment}</div>
-                  <div className="text-xs text-gray-600 truncate">
-                    {result.raw_extraction.reddit_flags.length === 0 ? 'No major flags' : result.raw_extraction.reddit_flags[0]}
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
+    <div className="min-h-screen bg-white text-gray-900 font-sans p-8 md:p-16">
+      <div className="max-w-2xl mx-auto">
+        
+        {/* Simple Header */}
+        <div className="mb-8">
+          <h1 className="text-xl font-bold text-black tracking-tight mb-1">Litmus</h1>
+          <p className="text-sm text-gray-500">Autonomous company verification and job authenticity engine.</p>
         </div>
-      </div>
 
-      {/* Sidebar: Recent Scans */}
-      <div className="w-72 bg-gray-50 border-l border-gray-200 p-6 overflow-y-auto">
-        <h3 className="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-4">
-          Scan History
-        </h3>
-        {history.length === 0 ? (
-          <p className="text-xs text-gray-400">No records found.</p>
-        ) : (
-          <div className="space-y-2">
-            {history.map((item, idx) => (
-              <div key={idx} className="p-3 bg-white border border-gray-200 rounded-md hover:border-gray-400 cursor-pointer transition-all" onClick={() => {setResult(item); setCompanyName(item.company_name);}}>
-                <div className="flex justify-between items-center mb-1">
-                  <span className="font-medium text-xs text-black truncate">{item.company_name}</span>
-                  <span className="text-xs font-semibold text-gray-700">
-                    {item.reality_score.total_score}
-                  </span>
-                </div>
-                <div className="text-[10px] text-gray-400 truncate">{item.job_url}</div>
+        {/* Input Form */}
+        <div className="space-y-3 mb-8">
+          <input 
+            type="text" 
+            className="w-full px-4 py-3 rounded border border-gray-300 text-sm focus:outline-none focus:border-black transition-colors"
+            placeholder="Enter company name (e.g. Zomato) or job URL..." 
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && startAnalysis()}
+          />
+          <button 
+            onClick={startAnalysis} 
+            className="w-full bg-black text-white py-3 rounded text-sm font-medium hover:bg-gray-800 transition-colors disabled:opacity-50"
+            disabled={loading}
+          >
+            {loading ? 'Scanning public records...' : 'Run Verification'}
+          </button>
+        </div>
+
+        {/* Terminal Logs during loading */}
+        {loading && (
+          <div className="bg-gray-50 border border-gray-200 p-4 rounded text-xs font-mono text-gray-700 space-y-2 mb-8">
+            <div className="text-gray-400 pb-1 border-b border-gray-200">Execution Logs</div>
+            {liveStatus.map((item, idx) => (
+              <div key={idx} className="flex justify-between items-center">
+                <span>[{item.step}] {item.message}</span>
+                <span className="text-gray-400 capitalize">{item.state}</span>
               </div>
             ))}
           </div>
         )}
-      </div>
 
+        {/* Results Section */}
+        {report && !loading && (
+          <div className="space-y-6 pt-4 border-t border-gray-100">
+            
+            {/* Main Score Box */}
+            <div className="flex justify-between items-baseline">
+              <div>
+                <h2 className="text-lg font-bold text-black">{report.company}</h2>
+                <p className="text-xs text-gray-500 mt-0.5">Status: <span className="text-black font-medium">{report.verdict}</span></p>
+              </div>
+              <div className="text-right">
+                <span className="text-3xl font-bold text-black">{report.total}</span>
+                <span className="text-sm text-gray-400"> / 100</span>
+              </div>
+            </div>
+
+            {/* Metrics List */}
+            <div className="grid grid-cols-3 gap-4 py-4 border-y border-gray-100 text-xs">
+              <div>
+                <div className="text-gray-400 mb-1">Legal / MCA</div>
+                <div className="font-bold text-black">{report.breakdown.legal ? `${report.breakdown.legal.score}/${report.breakdown.legal.max}` : 'N/A'}</div>
+                <div className="text-gray-500 truncate mt-0.5">{report.details?.legal?.found ? report.details.legal.cin : 'Unregistered'}</div>
+              </div>
+              <div>
+                <div className="text-gray-400 mb-1">Hiring Velocity</div>
+                <div className="font-bold text-black">{report.breakdown.velocity ? `${report.breakdown.velocity.score}/${report.breakdown.velocity.max}` : 'N/A'}</div>
+                <div className="text-gray-500 mt-0.5">{report.details?.velocity?.openings_listed || 0} openings</div>
+              </div>
+              <div>
+                <div className="text-gray-400 mb-1">Sentiment</div>
+                <div className="font-bold text-black">{report.breakdown.sentiment ? `${report.breakdown.sentiment.score}/${report.breakdown.sentiment.max}` : 'N/A'}</div>
+                <div className="text-gray-500 mt-0.5">{Object.keys(report.details?.sentiment?.risk_hits || {}).length} risk flags</div>
+              </div>
+            </div>
+
+            {/* Flags */}
+            {report.flags && report.flags.length > 0 && (
+              <div>
+                <h3 className="text-xs font-bold text-black uppercase tracking-wider mb-2">Flags</h3>
+                <ul className="text-xs text-gray-600 space-y-1">
+                  {report.flags.map((flag: string, idx: number) => (
+                    <li key={idx}>- {flag}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {/* Sources */}
+            {report.sources && report.sources.length > 0 && (
+              <div>
+                <h3 className="text-xs font-bold text-black uppercase tracking-wider mb-2">Sources</h3>
+                <div className="space-y-1">
+                  {report.sources.map((src: any, idx: number) => (
+                    <div key={idx} className="text-xs truncate">
+                      <a href={src.url} target="_blank" rel="noreferrer" className="text-blue-600 hover:underline">
+                        {src.label}
+                      </a>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+          </div>
+        )}
+
+      </div>
     </div>
   );
 }
